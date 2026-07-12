@@ -1,22 +1,11 @@
-# Kleinanzeigen Order Tool v1.2
+# Kleinanzeigen Order Tool v1.3
 
-Kleines Server-Tool, um aus Kleinanzeigen-Kontaktdaten Shopify Draft Orders zu erstellen.
+Neuerungen:
 
-## v1.2
+- Kleinanzeigen-Nachricht einfügen und Kontaktdaten automatisch übernehmen
+- Standardsuche: `100 gemischte Pokemon Karten Deutsch`
+- benutzerdefinierte Artikel mit Wunschpreis
+- Standardversand: Kleinpaket für 4,29 €
+- Shopify Draft Orders per Admin API
 
-Fix: Der Status-Check für Shopify-Scopes nutzt jetzt den richtigen Endpoint `/admin/oauth/access_scopes.json` statt `/admin/api/<version>/oauth/access_scopes.json`.
-
-## Env
-
-```env
-SHOPIFY_SHOP=20980d-fd.myshopify.com
-SHOPIFY_TOKEN=
-SHOPIFY_CLIENT_ID=DEINE_CLIENT_ID
-SHOPIFY_CLIENT_SECRET=DEIN_SCHLUESSEL
-SHOPIFY_API_VERSION=2026-04
-DASH_USER=admin
-DASH_PASS=KleinTool!2026
-SECRET_KEY=BitteAendern
-DEFAULT_SHIPPING=5.99
-PORT=8789
-```
+Secrets gehören nur in `.env` auf dem Server.
