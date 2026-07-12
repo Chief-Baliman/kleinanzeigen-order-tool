@@ -1,23 +1,22 @@
-# Kleinanzeigen Order Tool v1.1
+# Kleinanzeigen Order Tool v1.2
 
-Erstellt Shopify Draft Orders aus reinkopierten Kleinanzeigen-Daten.
+Kleines Server-Tool, um aus Kleinanzeigen-Kontaktdaten Shopify Draft Orders zu erstellen.
 
-## Shopify Zugang
+## v1.2
 
-Das Tool unterstützt zwei Varianten:
+Fix: Der Status-Check für Shopify-Scopes nutzt jetzt den richtigen Endpoint `/admin/oauth/access_scopes.json` statt `/admin/api/<version>/oauth/access_scopes.json`.
 
-1. `SHOPIFY_TOKEN`, falls Shopify dir einen klassischen Admin API Access Token zeigt.
-2. `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`, wenn die App im neuen Shopify Dev Dashboard erstellt wurde. Dann holt das Tool den Admin API Access Token automatisch per Client-Credentials-Flow.
+## Env
 
-Benötigte Scopes:
-
-`read_products,read_inventory,read_locations,read_customers,write_customers,read_draft_orders,write_draft_orders`
-
-## Server
-
-```bash
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-cp .env.example .env
-./venv/bin/python app.py
+```env
+SHOPIFY_SHOP=20980d-fd.myshopify.com
+SHOPIFY_TOKEN=
+SHOPIFY_CLIENT_ID=DEINE_CLIENT_ID
+SHOPIFY_CLIENT_SECRET=DEIN_SCHLUESSEL
+SHOPIFY_API_VERSION=2026-04
+DASH_USER=admin
+DASH_PASS=KleinTool!2026
+SECRET_KEY=BitteAendern
+DEFAULT_SHIPPING=5.99
+PORT=8789
 ```

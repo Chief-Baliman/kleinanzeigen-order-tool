@@ -121,6 +121,21 @@ def shopify_rest(path, method='GET', payload=None):
     return res.json()
 
 
+def shopify_access_scopes():
+    # Dieser Endpoint ist bei Shopify nicht unter /admin/api/<version>/ erreichbar.
+    # Der alte Status-Check lief deshalb auf /admin/api/<version>/oauth/access_scopes.json
+    # und bekam korrekt 404 Not Found.
+    url = f'https://{SHOPIFY_SHOP}/admin/oauth/access_scopes.json'
+    res = requests.get(url, headers=shopify_headers(), timeout=45)
+    if res.status_code >= 400:
+        try:
+            detail = res.json()
+        except Exception:
+            detail = res.text[:1000]
+        raise RuntimeError(f'Shopify Scope-Check Fehler {res.status_code}: {detail}')
+    return res.json()
+
+
 def shopify_graphql(query, variables=None):
     url = f'https://{SHOPIFY_SHOP}/admin/api/{SHOPIFY_API_VERSION}/graphql.json'
     res = requests.post(url, headers=shopify_headers(), json={'query': query, 'variables': variables or {}}, timeout=45)
@@ -195,7 +210,7 @@ def index():
 @require_login
 def api_health():
     try:
-        scopes_data = shopify_rest('/oauth/access_scopes.json')
+        scopes_data = shopify_access_scopes()
         scopes = [s.get('handle') for s in scopes_data.get('access_scopes', [])]
         return jsonify({
             'ok': True,
