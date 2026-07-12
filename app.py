@@ -169,6 +169,162 @@ def clean_phone(phone):
     return (phone or '').strip()
 
 
+
+
+def parse_contact_text(raw):
+    """Parse copied Kleinanzeigen/customer contact text into Shopify customer fields.
+
+    The parser is deliberately heuristic and conservative: it returns parsed fields,
+    confidence hints and the raw lines that were used, without inventing missing data.
+    """
+    text = (raw or '').replace('\r', '\n').replace('\t', ' ')
+    text = re.sub(r'\u00a0', ' ', text)
+    lines = [re.sub(r'\s+', ' ', l).strip(' ,;') for l in text.split('\n')]
+    lines = [l for l in lines if l]
+    flat = '\n'.join(lines)
+
+    result = {
+        'firstName': '',
+        'lastName': '',
+        'email': '',
+        'phone': '',
+        'address1': '',
+        'address2': '',
+        'zip': '',
+        'city': '',
+        'country': 'Deutschland',
+    }
+    evidence = []
+
+    def set_field(key, value, reason):
+        value = (value or '').strip(' ,;')
+        if value and not result.get(key):
+            result[key] = value
+            evidence.append({'field': key, 'value': value, 'reason': reason})
+
+    # Labelled values can occur as "Name: Max", "Adresse - ...", etc.
+    label_patterns = [
+        (r'^(?:vorname|first\s*name)\s*[:=\-]\s*(.+)$', 'firstName'),
+        (r'^(?:nachname|last\s*name|familienname)\s*[:=\-]\s*(.+)$', 'lastName'),
+        (r'^(?:name|vollständiger\s*name|vollstaendiger\s*name)\s*[:=\-]\s*(.+)$', 'fullName'),
+        (r'^(?:e\s*-?\s*mail|mail|email)\s*[:=\-]\s*(.+)$', 'email'),
+        (r'^(?:telefon|tel\.?|handy|mobil|phone)\s*[:=\-]\s*(.+)$', 'phone'),
+        (r'^(?:straße|strasse|anschrift|adresse|address)\s*[:=\-]\s*(.+)$', 'addressCombined'),
+        (r'^(?:adresszusatz|zusatz|address2)\s*[:=\-]\s*(.+)$', 'address2'),
+        (r'^(?:plz|postleitzahl)\s*[:=\-]\s*(\d{5}).*$', 'zip'),
+        (r'^(?:ort|stadt|city)\s*[:=\-]\s*(.+)$', 'city'),
+        (r'^(?:land|country)\s*[:=\-]\s*(.+)$', 'country'),
+    ]
+    for line in lines:
+        for pat, key in label_patterns:
+            m = re.match(pat, line, flags=re.I)
+            if not m:
+                continue
+            val = m.group(1).strip()
+            if key == 'fullName':
+                parts = [x for x in val.split() if x]
+                if parts:
+                    set_field('firstName', parts[0], 'gelabelter Name')
+                    if len(parts) > 1:
+                        set_field('lastName', ' '.join(parts[1:]), 'gelabelter Name')
+            elif key == 'addressCombined':
+                # e.g. Adresse: Musterstraße 1, 41539 Dormagen
+                chunks = [c.strip() for c in re.split(r'[,;|]', val) if c.strip()]
+                if chunks:
+                    set_field('address1', chunks[0], 'gelabelte Adresse')
+                    rest = ' '.join(chunks[1:])
+                    mzc = re.search(r'\b(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .\-]{1,70})', rest)
+                    if mzc:
+                        set_field('zip', mzc.group(1), 'gelabelte Adresse')
+                        set_field('city', mzc.group(2).strip(), 'gelabelte Adresse')
+            else:
+                set_field(key, val, 'gelabelte Angabe')
+
+    # E-mail.
+    m = re.search(r'[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}', flat, flags=re.I)
+    if m:
+        set_field('email', m.group(0), 'E-Mail-Muster')
+
+    # Phone. Prefer a labelled phone line, otherwise any German-looking phone number.
+    phone_candidates = []
+    for line in lines:
+        if re.search(r'(telefon|tel\.?|handy|mobil|phone)', line, re.I):
+            phone_candidates.append(line)
+    phone_candidates.append(flat)
+    for source in phone_candidates:
+        m = re.search(r'(?:\+49|0049|0)\s*[1-9][0-9\s()/.\-]{6,}', source)
+        if m:
+            phone = re.sub(r'\s{2,}', ' ', m.group(0)).strip(' .,/;-')
+            set_field('phone', phone, 'Telefonnummer-Muster')
+            break
+
+    # Zip and city. Supports "41539 Dormagen" on same line, or zip line followed by city line.
+    for i, line in enumerate(lines):
+        m = re.search(r'\b(\d{5})\b\s*([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .\-]{1,70})?$', line)
+        if m:
+            set_field('zip', m.group(1), 'PLZ-Muster')
+            if m.group(2):
+                set_field('city', m.group(2).strip(), 'PLZ-Ort-Muster')
+            elif i + 1 < len(lines) and re.match(r'^[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .\-]{1,70}$', lines[i + 1]):
+                set_field('city', lines[i + 1], 'Ort nach PLZ')
+            break
+
+    # Street line. Common German street suffixes plus house number.
+    street_rx = re.compile(r'\b([A-Za-zÄÖÜäöüß0-9 .\-]+?(?:straße|strasse|str\.?|weg|allee|platz|gasse|ring|damm|ufer|chaussee|markt|hof|steig|pfad|kamp|wall|promenade)\s+\d+[A-Za-z]?(?:\s*[-/]\s*\d+[A-Za-z]?)?)\b', re.I)
+    for line in lines:
+        m = street_rx.search(line)
+        if m:
+            set_field('address1', m.group(1).strip(), 'Straße-Hausnummer-Muster')
+            break
+
+    # Some users write street without typical suffix but with label handled above. Add a conservative fallback.
+    if not result['address1']:
+        for line in lines:
+            if re.search(r'\d+[a-zA-Z]?$', line) and not re.search(r'@|\b\d{5}\b|(?:\+49|0049|0)\s*[1-9][0-9\s()/.\-]{6,}', line):
+                words = line.split()
+                if len(words) >= 2 and len(line) <= 80:
+                    set_field('address1', line, 'Adresszeile mit Hausnummer')
+                    break
+
+    # Country.
+    if re.search(r'\b(deutschland|germany|de)\b', flat, flags=re.I):
+        set_field('country', 'Deutschland', 'Land erkannt')
+
+    # Name. Exclude lines that are clearly not names.
+    def looks_like_name(line):
+        if len(line) > 60 or len(line) < 3:
+            return False
+        if re.search(r'@|\b\d{5}\b|\d+[a-zA-Z]?$|(?:\+49|0049|0)\s*[1-9][0-9\s()/.\-]{6,}|:', line):
+            return False
+        if re.search(r'(hallo|hi|moin|guten|adresse|versand|paket|paypal|danke|gruß|gruss|lg|preis|€|eur|karten|pokemon|pokémon|booster)', line, re.I):
+            return False
+        words = [w for w in line.split() if w]
+        return 2 <= len(words) <= 4 and all(re.match(r'^[A-Za-zÄÖÜäöüß\-]+$', w) for w in words)
+
+    if not result['firstName'] or not result['lastName']:
+        for line in lines:
+            if looks_like_name(line):
+                parts = line.split()
+                set_field('firstName', parts[0], 'Namenszeile')
+                set_field('lastName', ' '.join(parts[1:]), 'Namenszeile')
+                break
+
+    # If labelled first/last name landed in one field accidentally.
+    if result['firstName'] and not result['lastName'] and len(result['firstName'].split()) > 1:
+        parts = result['firstName'].split()
+        result['firstName'] = parts[0]
+        result['lastName'] = ' '.join(parts[1:])
+        evidence.append({'field': 'lastName', 'value': result['lastName'], 'reason': 'Vorname-Feld aufgeteilt'})
+
+    filled = [k for k, v in result.items() if v]
+    return {
+        'ok': True,
+        'fields': result,
+        'filled': filled,
+        'evidence': evidence,
+        'lineCount': len(lines),
+    }
+
 def build_address(data):
     country = (data.get('country') or 'Deutschland').strip()
     return {
@@ -224,6 +380,16 @@ def api_health():
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/parse-contact', methods=['POST'])
+@require_login
+def api_parse_contact():
+    data = request.json or {}
+    raw = data.get('text') or ''
+    if not raw.strip():
+        return jsonify({'error': 'Kein Text zum Parsen übergeben.'}), 400
+    return jsonify(parse_contact_text(raw))
 
 
 @app.route('/api/products')
@@ -390,8 +556,34 @@ body{margin:0;background:#071014;color:#eef3f5;font-family:system-ui,-apple-syst
 
 
 INDEX_HTML = '''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kleinanzeigen Order Tool</title><style>
-:root{--bg:#071014;--card:#101b22;--line:#29444f;--text:#eef3f5;--muted:#9fb0bb;--gold:#f2ad3d;--good:#4fe38a;--bad:#ff6b6b}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}header{position:sticky;top:0;background:rgba(7,16,20,.95);border-bottom:1px solid var(--line);padding:16px 20px;z-index:2}.wrap{max-width:1220px;margin:0 auto;padding:20px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:900px){.grid{grid-template-columns:1fr}}.card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:18px;margin-bottom:18px}input,textarea,select,button{box-sizing:border-box;border-radius:14px;padding:12px;font-size:15px}input,textarea,select{width:100%;border:1px solid var(--line);background:#071014;color:#fff}label{display:block;color:var(--muted);font-weight:700;margin:12px 0 6px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:650px){.row{grid-template-columns:1fr}}button{border:0;background:var(--gold);color:#111;font-weight:900;cursor:pointer}button.secondary{background:#223044;color:#fff}.pill{display:inline-block;background:#223044;border-radius:999px;padding:7px 10px;margin:4px 4px 0 0;color:#cbd5dc}.result,.selected{border:1px solid var(--line);border-radius:16px;padding:12px;margin-top:10px;background:#0b151c}.small{color:var(--muted);font-size:13px}.ok{color:var(--good)}.bad{color:var(--bad)}a{color:#9dc9ff}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.top{display:flex;justify-content:space-between;gap:12px;align-items:center}.msg{padding:12px;border-radius:14px;margin:10px 0}.msg.okmsg{background:#0c2b1c;border:1px solid #236b45}.msg.err{background:#351414;border:1px solid #7d3333}.mini{font-size:12px;color:var(--muted)}.custombox{border:1px dashed #48627a;border-radius:16px;padding:12px;margin-top:14px;background:#0a151b}</style></head><body><header><div class="top"><div><strong>Kleinanzeigen Order Tool</strong><div class="small">Kleinanzeigen-Nachricht rein, Produkt wählen, Draft Order erstellen.</div></div><a href="/logout">Logout</a></div></header><main class="wrap"><div id="message"></div><div class="card"><h2>Status</h2><div id="health" class="small">Lade Status...</div></div><div class="grid"><section class="card"><h2>Kunde</h2><label>Kleinanzeigen-Nachricht einfügen</label><textarea id="rawContact" rows="7" placeholder="Hier die Nachricht oder Kontaktdaten vom Kunden einfügen. Beispiel:\nMax Mustermann\nMusterstraße 12\n41539 Dormagen\nmax@example.de\n0176 12345678"></textarea><div class="actions" style="margin-top:10px"><button type="button" onclick="parseContact()">Kontaktdaten automatisch übernehmen</button><button class="secondary" type="button" onclick="clearCustomer()">Kunde leeren</button></div><div class="mini">Der Parser erkennt E-Mail, Telefon, PLZ/Ort, Straße, Name und gelabelte Angaben auch in anderer Reihenfolge.</div><div class="row"><div><label>Vorname</label><input id="firstName"></div><div><label>Nachname</label><input id="lastName"></div></div><div class="row"><div><label>E-Mail</label><input id="email" type="email"></div><div><label>Telefon</label><input id="phone"></div></div><label>Straße und Hausnummer</label><input id="address1"><label>Adresszusatz</label><input id="address2"><div class="row"><div><label>PLZ</label><input id="zip"></div><div><label>Ort</label><input id="city"></div></div><label>Land</label><input id="country" value="Deutschland"></section><section class="card"><h2>Produkt suchen</h2><label>Suchbegriff</label><div class="actions"><input id="search" value="100 gemischte Pokemon Karten Deutsch" placeholder="z. B. Pikachu, OP16, Booster" style="flex:1;min-width:220px"><button onclick="searchProducts()">Suchen</button></div><div id="results"></div><div class="custombox"><h3>Benutzerdefinierter Artikel</h3><label>Titel</label><input id="customTitle" placeholder="z. B. 100 gemischte Pokémon Karten Deutsch"><div class="row"><div><label>Wunschpreis</label><input id="customPrice" type="number" step="0.01" placeholder="z. B. 19.99"></div><div><label>Menge</label><input id="customQty" type="number" min="1" value="1"></div></div><button class="secondary" type="button" onclick="addCustomItem()">Benutzerdefinierten Artikel hinzufügen</button></div></section></div><section class="card"><h2>Ausgewählte Artikel</h2><div id="selected"></div></section><section class="card"><h2>Versand und Notiz</h2><div class="row"><div><label>Versandbezeichnung</label><input id="shippingTitle" value="Kleinpaket"></div><div><label>Versandkosten</label><input id="shippingPrice" type="number" step="0.01" value="4.29"></div></div><label>Notiz</label><textarea id="note" rows="4" placeholder="Quelle: Kleinanzeigen, vereinbarter Preis, Hinweise..."></textarea><br><br><button onclick="createDraftOrder()">Draft Order in Shopify erstellen</button></section><section class="card"><h2>Letzte Draft Orders</h2><div id="recent"></div></section></main><script>
-let selected=[];const DEFAULT_QUERY='100 gemischte Pokemon Karten Deutsch';function msg(t,ok=true){document.getElementById('message').innerHTML=`<div class="msg ${ok?'okmsg':'err'}">${esc(t)}</div>`}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function api(url,opt){const r=await fetch(url,opt);let d;try{d=await r.json()}catch(e){d={error:await r.text()}}if(!r.ok)throw new Error(d.error||'Fehler');return d}async function loadHealth(){try{const h=await api('/api/health');document.getElementById('shippingPrice').value=h.defaultShipping||'4.29';if(!document.getElementById('shippingTitle').value)document.getElementById('shippingTitle').value='Kleinpaket';const missing=h.missingRecommendedScopes||[];document.getElementById('health').innerHTML=`<div>Shop: <span class="ok">${esc(h.shop)}</span> · API: ${esc(h.apiVersion)}</div><div>Scopes: ${(h.scopes||[]).map(x=>`<span class="pill">${esc(x)}</span>`).join('')}</div>`+(missing.length?`<div class="bad">Fehlende empfohlene Scopes: ${missing.map(esc).join(', ')}</div>`:'<div class="ok">Alle empfohlenen Scopes vorhanden.</div>')}catch(e){document.getElementById('health').innerHTML=`<span class="bad">${esc(e.message)}</span>`}}async function searchProducts(){const q=document.getElementById('search').value.trim();if(q.length<2)return msg('Bitte mindestens 2 Zeichen suchen.',false);document.getElementById('results').innerHTML='Suche...';try{const data=await api('/api/products?q='+encodeURIComponent(q));document.getElementById('results').innerHTML=data.map(p=>`<div class="result"><strong>${esc(p.title)}</strong><div class="small">${esc(p.status)} · ${esc(p.handle)}</div>${p.variants.map(v=>`<div class="actions" style="margin-top:8px"><span class="pill">${esc(v.title)} · ${esc(v.price)} € · Bestand: ${esc(v.inventoryQuantity)}</span><button class="secondary" onclick='addItem(${JSON.stringify({productTitle:p.title,variantTitle:v.title,variantId:v.id,variantNumericId:v.numericId,price:v.price,sku:v.sku}).replace(/'/g,"&#39;")})'>Hinzufügen</button></div>`).join('')}</div>`).join('')||'Keine Treffer.'}catch(e){document.getElementById('results').innerHTML='';msg(e.message,false)}}function addItem(item){item.quantity=1;item.custom=false;selected.push(item);renderSelected()}function addCustomItem(){const title=document.getElementById('customTitle').value.trim();const price=document.getElementById('customPrice').value.trim();const qty=Math.max(1,parseInt(document.getElementById('customQty').value||1));if(!title)return msg('Bitte Titel für den benutzerdefinierten Artikel eintragen.',false);if(!price)return msg('Bitte Wunschpreis eintragen.',false);selected.push({custom:true,title,price,quantity:qty});document.getElementById('customTitle').value='';document.getElementById('customPrice').value='';document.getElementById('customQty').value='1';renderSelected()}function removeItem(i){selected.splice(i,1);renderSelected()}function setQty(i,v){selected[i].quantity=Math.max(1,parseInt(v||1));renderSelected()}function renderSelected(){document.getElementById('selected').innerHTML=selected.map((it,i)=>{const title=it.custom?it.title:it.productTitle;const sub=it.custom?'Benutzerdefiniert':it.variantTitle;const price=it.custom?it.price:it.price;return `<div class="selected"><strong>${esc(title)}</strong><div>${esc(sub)} · ${esc(price)} €</div><div class="actions" style="margin-top:8px"><input type="number" value="${it.quantity}" min="1" style="width:100px" onchange="setQty(${i},this.value)"><button class="secondary" onclick="removeItem(${i})">Entfernen</button></div></div>`}).join('')||'<div class="small">Noch keine Artikel ausgewählt.</div>'}function val(id){return document.getElementById(id).value}function setVal(id,v){if(v!==undefined&&v!==null&&String(v).trim())document.getElementById(id).value=String(v).trim()}function parseContact(){const raw=document.getElementById('rawContact').value||'';if(!raw.trim())return msg('Bitte zuerst eine Nachricht einfügen.',false);let text=raw.replace(/\r/g,'\n');const lines=text.split('\n').map(l=>l.trim()).filter(Boolean);const found={};const email=(text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)||[])[0];if(email)found.email=email;let phone=(text.match(/(?:\+49|0049|0)[\d\s()\/-]{7,}/)||[])[0];if(phone)found.phone=phone.replace(/\s{2,}/g,' ').trim();const zipCity=text.match(/\b(\d{5})\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß .\-]{1,60})/);if(zipCity){found.zip=zipCity[1];found.city=zipCity[2].split('\n')[0].trim()}const labelMap=[[/^(vorname|first name)\s*[:=-]\s*(.+)$/i,'firstName'],[/^(nachname|name|last name)\s*[:=-]\s*(.+)$/i,'lastName'],[/^(e-?mail|mail|email)\s*[:=-]\s*(.+)$/i,'email'],[/^(telefon|tel|handy|mobil|phone)\s*[:=-]\s*(.+)$/i,'phone'],[/^(straße|strasse|anschrift|adresse|address)\s*[:=-]\s*(.+)$/i,'address1'],[/^(adresszusatz|zusatz|address2)\s*[:=-]\s*(.+)$/i,'address2'],[/^(plz)\s*[:=-]\s*(.+)$/i,'zip'],[/^(ort|stadt|city)\s*[:=-]\s*(.+)$/i,'city'],[/^(land|country)\s*[:=-]\s*(.+)$/i,'country']];for(const line of lines){for(const [rx,key] of labelMap){const m=line.match(rx);if(m)found[key]=m[2].trim()}}for(const line of lines){if(!found.address1 && /\d+\s*[a-zA-Z]?$/.test(line) && /(str\.?|straße|strasse|weg|allee|platz|gasse|ring|damm|ufer|chaussee|markt)/i.test(line)){found.address1=line}if(!found.zip){const m=line.match(/\b(\d{5})\b/);if(m)found.zip=m[1]}if(found.zip && !found.city){const m=line.match(new RegExp(found.zip+'\\s+(.+)$'));if(m)found.city=m[1].trim()}}const used=new Set([found.email,found.phone,found.address1]);let candidateNames=lines.filter(l=>!used.has(l)&&!/@/.test(l)&&!/\b\d{5}\b/.test(l)&&!/(str\.?|straße|strasse|weg|allee|platz|gasse|ring|damm|ufer|chaussee|markt)/i.test(l)&&!/:/.test(l)&&l.length<60);if((!found.firstName||!found.lastName)&&candidateNames.length){let words=candidateNames[0].split(/\s+/).filter(Boolean);if(words.length>=2){found.firstName=found.firstName||words[0];found.lastName=found.lastName||words.slice(1).join(' ')}else if(words.length===1){found.firstName=found.firstName||words[0]}}setVal('firstName',found.firstName);setVal('lastName',found.lastName);setVal('email',found.email);setVal('phone',found.phone);setVal('address1',found.address1);setVal('address2',found.address2);setVal('zip',found.zip);setVal('city',found.city);setVal('country',found.country||'Deutschland');msg('Kontaktdaten übernommen. Bitte kurz prüfen.',true)}function clearCustomer(){['rawContact','firstName','lastName','email','phone','address1','address2','zip','city'].forEach(id=>document.getElementById(id).value='');document.getElementById('country').value='Deutschland'}async function createDraftOrder(){if(!selected.length)return msg('Bitte mindestens einen Artikel auswählen.',false);const payload={customer:{firstName:val('firstName'),lastName:val('lastName'),email:val('email'),phone:val('phone'),address1:val('address1'),address2:val('address2'),zip:val('zip'),city:val('city'),country:val('country')},items:selected,shipping:{title:val('shippingTitle'),price:val('shippingPrice')},note:val('note')};try{msg('Erstelle Draft Order...');const r=await api('/api/draft-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=r.draftOrder;msg(`Draft Order ${d.name||d.id} erstellt.`,true);selected=[];renderSelected();loadRecent();if(d.adminUrl)window.open(d.adminUrl,'_blank')}catch(e){msg(e.message,false)}}async function loadRecent(){try{const rows=await api('/api/recent');document.getElementById('recent').innerHTML=rows.map(r=>`<div class="result"><strong>${esc(r.shopify_name||r.shopify_id)}</strong><div>${esc(r.customer_name)} · ${esc(r.total_price)} €</div><div class="small">${esc(r.created_at)}</div><a href="${esc(r.admin_url)}" target="_blank">In Shopify öffnen</a></div>`).join('')||'<div class="small">Noch keine Draft Orders.</div>'}catch(e){document.getElementById('recent').textContent=e.message}}loadHealth();renderSelected();loadRecent();setTimeout(()=>{if(document.getElementById('search').value===DEFAULT_QUERY)searchProducts()},250);</script></body></html>'''
+:root{--bg:#071014;--card:#101b22;--line:#29444f;--text:#eef3f5;--muted:#9fb0bb;--gold:#f2ad3d;--good:#4fe38a;--bad:#ff6b6b}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif}header{position:sticky;top:0;background:rgba(7,16,20,.95);border-bottom:1px solid var(--line);padding:16px 20px;z-index:2}.wrap{max-width:1220px;margin:0 auto;padding:20px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:900px){.grid{grid-template-columns:1fr}}.card{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:18px;margin-bottom:18px}input,textarea,select,button{box-sizing:border-box;border-radius:14px;padding:12px;font-size:15px}input,textarea,select{width:100%;border:1px solid var(--line);background:#071014;color:#fff}label{display:block;color:var(--muted);font-weight:700;margin:12px 0 6px}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:650px){.row{grid-template-columns:1fr}}button{border:0;background:var(--gold);color:#111;font-weight:900;cursor:pointer}button.secondary{background:#223044;color:#fff}.pill{display:inline-block;background:#223044;border-radius:999px;padding:7px 10px;margin:4px 4px 0 0;color:#cbd5dc}.result,.selected{border:1px solid var(--line);border-radius:16px;padding:12px;margin-top:10px;background:#0b151c}.small{color:var(--muted);font-size:13px}.ok{color:var(--good)}.bad{color:var(--bad)}a{color:#9dc9ff}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.top{display:flex;justify-content:space-between;gap:12px;align-items:center}.msg{padding:12px;border-radius:14px;margin:10px 0}.msg.okmsg{background:#0c2b1c;border:1px solid #236b45}.msg.err{background:#351414;border:1px solid #7d3333}.mini{font-size:12px;color:var(--muted)}.custombox{border:1px dashed #48627a;border-radius:16px;padding:12px;margin-top:14px;background:#0a151b}</style></head><body><header><div class="top"><div><strong>Kleinanzeigen Order Tool</strong><div class="small">Kleinanzeigen-Nachricht rein, Produkt wählen, Draft Order erstellen.</div></div><a href="/logout">Logout</a></div></header><main class="wrap"><div id="message"></div><div class="card"><h2>Status</h2><div id="health" class="small">Lade Status...</div></div><div class="grid"><section class="card"><h2>Kunde</h2><label>Kleinanzeigen-Nachricht einfügen</label><textarea id="rawContact" rows="7" placeholder="Hier die Nachricht oder Kontaktdaten vom Kunden einfügen. Beispiel:\nMax Mustermann\nMusterstraße 12\n41539 Dormagen\nmax@example.de\n0176 12345678"></textarea><div class="actions" style="margin-top:10px"><button type="button" onclick="parseContact()">Kontaktdaten automatisch übernehmen</button><button class="secondary" type="button" onclick="clearCustomer()">Kunde leeren</button></div><div class="mini">Der Parser läuft jetzt serverseitig. Nach dem Klick siehst du genau, welche Felder erkannt wurden.</div><div id="parseResult" class="small" style="margin-top:10px"></div><div class="row"><div><label>Vorname</label><input id="firstName"></div><div><label>Nachname</label><input id="lastName"></div></div><div class="row"><div><label>E-Mail</label><input id="email" type="email"></div><div><label>Telefon</label><input id="phone"></div></div><label>Straße und Hausnummer</label><input id="address1"><label>Adresszusatz</label><input id="address2"><div class="row"><div><label>PLZ</label><input id="zip"></div><div><label>Ort</label><input id="city"></div></div><label>Land</label><input id="country" value="Deutschland"></section><section class="card"><h2>Produkt suchen</h2><label>Suchbegriff</label><div class="actions"><input id="search" value="100 gemischte Pokemon Karten Deutsch" placeholder="z. B. Pikachu, OP16, Booster" style="flex:1;min-width:220px"><button onclick="searchProducts()">Suchen</button></div><div id="results"></div><div class="custombox"><h3>Benutzerdefinierter Artikel</h3><label>Titel</label><input id="customTitle" placeholder="z. B. 100 gemischte Pokémon Karten Deutsch"><div class="row"><div><label>Wunschpreis</label><input id="customPrice" type="number" step="0.01" placeholder="z. B. 19.99"></div><div><label>Menge</label><input id="customQty" type="number" min="1" value="1"></div></div><button class="secondary" type="button" onclick="addCustomItem()">Benutzerdefinierten Artikel hinzufügen</button></div></section></div><section class="card"><h2>Ausgewählte Artikel</h2><div id="selected"></div></section><section class="card"><h2>Versand und Notiz</h2><div class="row"><div><label>Versandbezeichnung</label><input id="shippingTitle" value="Kleinpaket"></div><div><label>Versandkosten</label><input id="shippingPrice" type="number" step="0.01" value="4.29"></div></div><label>Notiz</label><textarea id="note" rows="4" placeholder="Quelle: Kleinanzeigen, vereinbarter Preis, Hinweise..."></textarea><br><br><button onclick="createDraftOrder()">Draft Order in Shopify erstellen</button></section><section class="card"><h2>Letzte Draft Orders</h2><div id="recent"></div></section></main><script>
+let selected=[];const DEFAULT_QUERY='100 gemischte Pokemon Karten Deutsch';function msg(t,ok=true){document.getElementById('message').innerHTML=`<div class="msg ${ok?'okmsg':'err'}">${esc(t)}</div>`}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function api(url,opt){const r=await fetch(url,opt);let d;try{d=await r.json()}catch(e){d={error:await r.text()}}if(!r.ok)throw new Error(d.error||'Fehler');return d}async function loadHealth(){try{const h=await api('/api/health');document.getElementById('shippingPrice').value=h.defaultShipping||'4.29';if(!document.getElementById('shippingTitle').value)document.getElementById('shippingTitle').value='Kleinpaket';const missing=h.missingRecommendedScopes||[];document.getElementById('health').innerHTML=`<div>Shop: <span class="ok">${esc(h.shop)}</span> · API: ${esc(h.apiVersion)}</div><div>Scopes: ${(h.scopes||[]).map(x=>`<span class="pill">${esc(x)}</span>`).join('')}</div>`+(missing.length?`<div class="bad">Fehlende empfohlene Scopes: ${missing.map(esc).join(', ')}</div>`:'<div class="ok">Alle empfohlenen Scopes vorhanden.</div>')}catch(e){document.getElementById('health').innerHTML=`<span class="bad">${esc(e.message)}</span>`}}async function searchProducts(){const q=document.getElementById('search').value.trim();if(q.length<2)return msg('Bitte mindestens 2 Zeichen suchen.',false);document.getElementById('results').innerHTML='Suche...';try{const data=await api('/api/products?q='+encodeURIComponent(q));document.getElementById('results').innerHTML=data.map(p=>`<div class="result"><strong>${esc(p.title)}</strong><div class="small">${esc(p.status)} · ${esc(p.handle)}</div>${p.variants.map(v=>`<div class="actions" style="margin-top:8px"><span class="pill">${esc(v.title)} · ${esc(v.price)} € · Bestand: ${esc(v.inventoryQuantity)}</span><button class="secondary" onclick='addItem(${JSON.stringify({productTitle:p.title,variantTitle:v.title,variantId:v.id,variantNumericId:v.numericId,price:v.price,sku:v.sku}).replace(/'/g,"&#39;")})'>Hinzufügen</button></div>`).join('')}</div>`).join('')||'Keine Treffer.'}catch(e){document.getElementById('results').innerHTML='';msg(e.message,false)}}function addItem(item){item.quantity=1;item.custom=false;selected.push(item);renderSelected()}function addCustomItem(){const title=document.getElementById('customTitle').value.trim();const price=document.getElementById('customPrice').value.trim();const qty=Math.max(1,parseInt(document.getElementById('customQty').value||1));if(!title)return msg('Bitte Titel für den benutzerdefinierten Artikel eintragen.',false);if(!price)return msg('Bitte Wunschpreis eintragen.',false);selected.push({custom:true,title,price,quantity:qty});document.getElementById('customTitle').value='';document.getElementById('customPrice').value='';document.getElementById('customQty').value='1';renderSelected()}function removeItem(i){selected.splice(i,1);renderSelected()}function setQty(i,v){selected[i].quantity=Math.max(1,parseInt(v||1));renderSelected()}function renderSelected(){document.getElementById('selected').innerHTML=selected.map((it,i)=>{const title=it.custom?it.title:it.productTitle;const sub=it.custom?'Benutzerdefiniert':it.variantTitle;const price=it.custom?it.price:it.price;return `<div class="selected"><strong>${esc(title)}</strong><div>${esc(sub)} · ${esc(price)} €</div><div class="actions" style="margin-top:8px"><input type="number" value="${it.quantity}" min="1" style="width:100px" onchange="setQty(${i},this.value)"><button class="secondary" onclick="removeItem(${i})">Entfernen</button></div></div>`}).join('')||'<div class="small">Noch keine Artikel ausgewählt.</div>'}function val(id){return document.getElementById(id).value}function setVal(id,v){if(v!==undefined&&v!==null&&String(v).trim())document.getElementById(id).value=String(v).trim()}async function parseContact(){
+  const raw=document.getElementById('rawContact').value||'';
+  if(!raw.trim()) return msg('Bitte zuerst eine Nachricht einfügen.',false);
+  const btns=[...document.querySelectorAll('button')].filter(b=>b.textContent.includes('Kontaktdaten'));
+  btns.forEach(b=>{b.disabled=true;b.dataset.old=b.textContent;b.textContent='Übernehme...'});
+  try{
+    const data=await api('/api/parse-contact',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:raw})});
+    const f=data.fields||{};
+    const ids=['firstName','lastName','email','phone','address1','address2','zip','city','country'];
+    let changed=[];
+    for(const id of ids){
+      if(f[id]!==undefined && f[id]!==null && String(f[id]).trim()){
+        document.getElementById(id).value=String(f[id]).trim();
+        changed.push(id);
+      }
+    }
+    const labels={firstName:'Vorname',lastName:'Nachname',email:'E-Mail',phone:'Telefon',address1:'Straße',address2:'Adresszusatz',zip:'PLZ',city:'Ort',country:'Land'};
+    const html=(data.evidence||[]).map(e=>`<span class="pill">${esc(labels[e.field]||e.field)}: ${esc(e.value)} <span class="mini">${esc(e.reason)}</span></span>`).join('');
+    document.getElementById('parseResult').innerHTML = html || '<span class="bad">Es wurden keine eindeutigen Kontaktdaten erkannt.</span>';
+    if(changed.length) msg('Kontaktdaten übernommen. Bitte kurz prüfen.',true); else msg('Keine eindeutigen Kontaktdaten erkannt. Bitte manuell prüfen.',false);
+  }catch(e){
+    document.getElementById('parseResult').innerHTML='<span class="bad">Parser-Fehler: '+esc(e.message)+'</span>';
+    msg(e.message,false);
+  }finally{
+    btns.forEach(b=>{b.disabled=false;b.textContent=b.dataset.old||'Kontaktdaten automatisch übernehmen'});
+  }
+}function clearCustomer(){['rawContact','firstName','lastName','email','phone','address1','address2','zip','city'].forEach(id=>document.getElementById(id).value='');document.getElementById('country').value='Deutschland'}async function createDraftOrder(){if(!selected.length)return msg('Bitte mindestens einen Artikel auswählen.',false);const payload={customer:{firstName:val('firstName'),lastName:val('lastName'),email:val('email'),phone:val('phone'),address1:val('address1'),address2:val('address2'),zip:val('zip'),city:val('city'),country:val('country')},items:selected,shipping:{title:val('shippingTitle'),price:val('shippingPrice')},note:val('note')};try{msg('Erstelle Draft Order...');const r=await api('/api/draft-orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const d=r.draftOrder;msg(`Draft Order ${d.name||d.id} erstellt.`,true);selected=[];renderSelected();loadRecent();if(d.adminUrl)window.open(d.adminUrl,'_blank')}catch(e){msg(e.message,false)}}async function loadRecent(){try{const rows=await api('/api/recent');document.getElementById('recent').innerHTML=rows.map(r=>`<div class="result"><strong>${esc(r.shopify_name||r.shopify_id)}</strong><div>${esc(r.customer_name)} · ${esc(r.total_price)} €</div><div class="small">${esc(r.created_at)}</div><a href="${esc(r.admin_url)}" target="_blank">In Shopify öffnen</a></div>`).join('')||'<div class="small">Noch keine Draft Orders.</div>'}catch(e){document.getElementById('recent').textContent=e.message}}loadHealth();renderSelected();loadRecent();setTimeout(()=>{if(document.getElementById('search').value===DEFAULT_QUERY)searchProducts()},250);</script></body></html>'''
 
 if __name__ == '__main__':
     init_db()
