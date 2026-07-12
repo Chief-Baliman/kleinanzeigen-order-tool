@@ -2,7 +2,8 @@ import os
 import re
 import json
 import sqlite3
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 import requests
@@ -16,6 +17,9 @@ DB_PATH = os.path.join(APP_DIR, 'orders.db')
 
 SHOPIFY_SHOP = os.getenv('SHOPIFY_SHOP', '').strip()
 SHOPIFY_TOKEN = os.getenv('SHOPIFY_TOKEN', '').strip()
+SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID', '').strip()
+SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET', '').strip()
+_token_cache = {'value': None, 'expires_at': 0}
 SHOPIFY_API_VERSION = os.getenv('SHOPIFY_API_VERSION', '2026-04').strip()
 DASH_USER = os.getenv('DASH_USER', 'admin')
 DASH_PASS = os.getenv('DASH_PASS', '')
@@ -63,11 +67,43 @@ def require_login(fn):
     return wrapper
 
 
+def get_shopify_token():
+    if not SHOPIFY_SHOP:
+        raise RuntimeError('SHOPIFY_SHOP fehlt in .env')
+
+    # Klassische Custom-App: fester Admin API Access Token, z. B. shpat_...
+    if SHOPIFY_TOKEN:
+        return SHOPIFY_TOKEN
+
+    # Neues Shopify Dev Dashboard: Client-Credentials-Flow.
+    # Der Access Token ist nur ca. 24h gültig und wird deshalb automatisch erneuert.
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        raise RuntimeError('Entweder SHOPIFY_TOKEN oder SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET müssen in .env gesetzt sein')
+
+    now = int(time.time())
+    if _token_cache.get('value') and _token_cache.get('expires_at', 0) > now + 120:
+        return _token_cache['value']
+
+    url = f'https://{SHOPIFY_SHOP}/admin/oauth/access_token'
+    res = requests.post(url, data={
+        'grant_type': 'client_credentials',
+        'client_id': SHOPIFY_CLIENT_ID,
+        'client_secret': SHOPIFY_CLIENT_SECRET,
+    }, timeout=45)
+    if res.status_code >= 400:
+        raise RuntimeError(f'Shopify Token-Fehler {res.status_code}: {res.text[:1000]}')
+    data = res.json()
+    token = data.get('access_token')
+    if not token:
+        raise RuntimeError(f'Keine access_token Antwort von Shopify: {json.dumps(data, ensure_ascii=False)[:600]}')
+    _token_cache['value'] = token
+    _token_cache['expires_at'] = now + int(data.get('expires_in') or 86399)
+    return token
+
+
 def shopify_headers():
-    if not SHOPIFY_SHOP or not SHOPIFY_TOKEN:
-        raise RuntimeError('SHOPIFY_SHOP oder SHOPIFY_TOKEN fehlt in .env')
     return {
-        'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+        'X-Shopify-Access-Token': get_shopify_token(),
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     }
