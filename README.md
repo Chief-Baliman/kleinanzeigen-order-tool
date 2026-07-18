@@ -1,86 +1,62 @@
-# Shopify Kleinanzeigen Tool
+# Kleinanzeigen Order Tool v2.0
 
-Interne Web-App zum Anlegen von Shopify-Bestellentwürfen aus Kleinanzeigen-Verkäufen.
+Interne Flask-Anwendung zum Erstellen von Shopify Draft Orders aus Kleinanzeigen-Verkäufen.
 
-## Aufbau
+## Änderungen in v2.0
 
-Die App läuft auf einem Ubuntu-Server. GitHub ist optional und wird nur zur Versionsverwaltung benötigt. Zugangsdaten liegen ausschließlich in der `.env` auf dem Server.
+- Draft Orders werden über die Shopify GraphQL Admin API erstellt.
+- Liefer- und Rechnungsadresse erhalten immer einen ISO-Ländercode. Standard ist `DE`.
+- Vor dem Erstellen führt Shopify eine echte Draft-Order-Berechnung durch.
+- Deutsche Bestellungen mit `0,00 EUR` Steuer werden standardmäßig blockiert, damit keine fehlerhaften Bestellungen an Lexware weitergegeben werden.
+- Benutzerdefinierte Artikel sind ausdrücklich steuerpflichtig.
+- Bei Shopify-Varianten wird geprüft, ob die Variante steuerpflichtig ist.
+- Der im Tool angezeigte Verkaufspreis wird als `priceOverride` übernommen.
+- Steuerbetrag, Tax Lines und Adresscodes werden im lokalen Audit-Payload gespeichert.
+- `.env`, Datenbank, virtuelle Umgebung und Cache sind über `.gitignore` geschützt.
 
-## Shopify vorbereiten, Stand Juli 2026
+## Wichtige Voraussetzung in Shopify
 
-1. Shopify Admin öffnen: Einstellungen > Apps > Apps entwickeln > Apps im Dev Dashboard erstellen.
-2. Eine App mit dem Namen `Kleinanzeigen Bestelltool` erstellen.
-3. Eine Version anlegen. Als App-URL kann bei einer nicht eingebetteten App zunächst `https://shopify.dev/apps/default-app-home` verwendet werden.
-4. Diese Admin-API-Berechtigungen eintragen:
-   - `read_products`
-   - `write_draft_orders`
-5. Version veröffentlichen und die App im eigenen Shop installieren.
-6. Im Dev Dashboard unter Einstellungen die Client-ID und das Client-Secret kopieren.
+Shopify berechnet die Steuer. Das Tool erfindet keine Steuerzeilen. Daher müssen in Shopify:
 
-Das Tool erzeugt mit diesen Daten automatisch einen Shopify-Zugriffstoken und erneuert ihn nach Ablauf.
+1. die deutsche Steuerregistrierung aktiv sein,
+2. die verwendeten Produktvarianten als steuerpflichtig markiert sein,
+3. die Preise entsprechend den Shop-Einstellungen als Bruttopreise oder Nettopreise gepflegt sein.
 
-## Installation auf Ubuntu
+`REQUIRE_TAXES=true` verhindert bei deutschen Bestellungen das Erstellen einer Draft Order, wenn Shopify keine Steuer berechnet.
 
-ZIP nach `/opt` auf den Server laden und dann ausführen:
+## Benötigte Scopes
 
-```bash
-cd /opt
-sudo unzip shopify-kleinanzeigen-tool.zip
-cd shopify-kleinanzeigen-tool
-sudo cp .env.example .env
-sudo nano .env
-npm install --omit=dev
-```
+- `read_products`
+- `write_draft_orders`
+- empfohlen: `read_draft_orders`
 
-In `.env` eintragen:
+## Sicheres Deployment
 
-```env
-PORT=8790
-APP_PASSWORD=EIN_EIGENES_SICHERES_PASSWORT
-SHOPIFY_STORE=dein-shop.myshopify.com
-SHOPIFY_CLIENT_ID=DEINE_CLIENT_ID
-SHOPIFY_CLIENT_SECRET=DEIN_CLIENT_SECRET
-SHOPIFY_API_VERSION=2026-07
-```
-
-## systemd
-
-Datei `/etc/systemd/system/shopify-kleinanzeigen.service` erstellen:
-
-```ini
-[Unit]
-Description=Shopify Kleinanzeigen Tool
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/shopify-kleinanzeigen-tool
-ExecStart=/usr/bin/npm start
-Restart=always
-RestartSec=5
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Aktivieren:
+Auf dem Server:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now shopify-kleinanzeigen.service
-sudo systemctl status shopify-kleinanzeigen.service
+ssh root@217.154.249.255
+cd /opt/kleinanzeigen-order-tool
+bash scripts/safe_deploy.sh
 ```
 
-Lokaler Test:
+Das Skript erstellt vor dem Update ein Code-Backup, lädt `main` nur als Fast-Forward, installiert Abhängigkeiten, prüft die Python-Syntax und startet den Dienst. Wenn der Dienst nicht startet, wird automatisch auf den vorherigen Git-Commit zurückgesetzt.
+
+## Manueller Test nach dem Deployment
+
+1. Einen steuerpflichtigen Shopify-Artikel auswählen.
+2. Eine deutsche Testadresse eintragen.
+3. Draft Order erstellen.
+4. In Shopify kontrollieren:
+   - Lieferadresse Deutschland
+   - Rechnungsadresse Deutschland
+   - enthaltener Steuerbetrag größer als 0
+   - Steuerzeile am Artikel
+   - Steuerzeile am Versand, sofern Shopify den Versand nach seiner Steuerkonfiguration besteuert
+5. Erst danach den Lexware-Import testen.
+
+## Lokale Tests
 
 ```bash
-curl http://127.0.0.1:8790
+python -m unittest discover -s tests -v
 ```
-
-Die App sollte anschließend zunächst unter `http://SERVER-IP:8790` erreichbar sein. Für den dauerhaften Einsatz Nginx mit HTTPS und einer Subdomain verwenden. Port 8790 muss dann nicht öffentlich geöffnet werden.
-
-## Adressen
-
-Deutschland ist standardmäßig ausgewählt. Das Tool übergibt den ISO-Ländercode ausdrücklich an Shopify und setzt Rechnungs- und Lieferadresse identisch. Für andere Länder kann der Ländercode geändert werden.
