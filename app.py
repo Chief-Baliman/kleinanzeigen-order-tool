@@ -455,9 +455,12 @@ def calculate_draft_order(draft_input):
           totalPriceSet { presentmentMoney { amount currencyCode } }
           totalTaxSet { presentmentMoney { amount currencyCode } }
           lineItems { title quantity taxable }
-          shippingAddress { countryCode }
-          billingAddress { countryCode }
-          taxExempt
+          taxesIncluded
+          taxLines { title rate ratePercentage priceSet { presentmentMoney { amount currencyCode } } }
+          shippingLine {
+            title
+            taxLines { title rate ratePercentage priceSet { presentmentMoney { amount currencyCode } } }
+          }
         }
         userErrors { field message }
       }
@@ -640,7 +643,7 @@ def api_create_draft_order():
         total_tax = safe_money(
             (((calculated.get('totalTaxSet') or {}).get('presentmentMoney') or {}).get('amount')) or '0'
         )
-        country_code = ((calculated.get('shippingAddress') or {}).get('countryCode') or DEFAULT_COUNTRY_CODE)
+        country_code = ((draft_input.get('shippingAddress') or {}).get('countryCode') or DEFAULT_COUNTRY_CODE)
         if REQUIRE_TAXES and country_code == 'DE' and float(total_tax) <= 0:
             raise ValueError(
                 'Shopify berechnet für diese deutsche Bestellung 0,00 € Umsatzsteuer. '
